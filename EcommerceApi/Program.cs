@@ -1,34 +1,56 @@
+using Dapper;
+using EcommerceApi.Api.Endpoints;
+using EcommerceApi.Infrastructure.Repositories;
+using Npgsql;
+using Serilog;
+using Serilog.Formatting.Compact;
+using System.Data;
+using Microsoft.AspNetCore.RateLimiting;
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
+builder.Host.UseSerilog((ctx, cfg) =>
+    cfg.MinimumLevel.Information()
+       .MinimumLevel.Override("Microsoft.AspNetCore", Serilog.Events.LogEventLevel.Warning)
+       .Enrich.FromLogContext()
+       .Enrich.WithProperty("Service", "EcommerceApi")
+       .WriteTo.Console(new RenderedCompactJsonFormatter()));
+
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
+    ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection is not configured.");
+
+builder.Services.AddTransient<IDbConnection>(_ => new NpgsqlConnection(connectionString));
+
+builder.Services.AddScoped<ProductRepository>();
+
+builder.Services.AddRateLimiter(opt =>
+{
+    opt.AddFixedWindowLimiter("api", lim =>
+    {
+        lim.PermitLimit = 60;
+        lim.Window = TimeSpan.FromMinutes(1);
+    });
+    opt.OnRejected = async (ctx, ct) =>
+    {
+        ctx.HttpContext.Response.StatusCode = 429;
+        await ctx.HttpContext.Response.WriteAsJsonAsync(new { error = "Too many requests" }, ct);
+    };
+});
+
+builder.Services.AddCors(opt =>
+    opt.AddPolicy("Frontend", p =>
+        p.WithOrigins(builder.Configuration.GetSection("AllowedOrigins").Get<string[]>() ?? [])
+         .WithMethods("GET", "POST")
+         .AllowAnyHeader()));
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
+app.UseRateLimiter();
+app.UseCors("Frontend");
 
-app.UseHttpsRedirection();
+var api = app.MapGroup("/api/v1/ecommerce");
+api.MapProductEndpoints();
 
-var summaries = new[]
-{
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
+app.MapGet("/health", () => Results.Ok(new { status = "healthy", ts = DateTime.UtcNow }));
 
-app.MapGet("/weatherforecast", () =>
-{
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return forecast;
-});
-
-app.Run();
-
-record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
-{
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
-}
+await app.RunAsync();
