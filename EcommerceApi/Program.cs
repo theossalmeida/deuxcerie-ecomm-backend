@@ -1,6 +1,8 @@
 using Dapper;
 using EcommerceApi.Api.Endpoints;
+using EcommerceApi.Application.Orders;
 using EcommerceApi.Infrastructure.Repositories;
+using EcommerceApi.Infrastructure.Services;
 using Npgsql;
 using Serilog;
 using Serilog.Formatting.Compact;
@@ -22,12 +24,19 @@ var connectionString = builder.Configuration.GetConnectionString("DefaultConnect
 builder.Services.AddTransient<IDbConnection>(_ => new NpgsqlConnection(connectionString));
 
 builder.Services.AddScoped<ProductRepository>();
+builder.Services.AddScoped<StorageService>();
+builder.Services.AddScoped<CreateOrderHandler>();
 
 builder.Services.AddRateLimiter(opt =>
 {
     opt.AddFixedWindowLimiter("api", lim =>
     {
         lim.PermitLimit = 60;
+        lim.Window = TimeSpan.FromMinutes(1);
+    });
+    opt.AddFixedWindowLimiter("orders", lim =>
+    {
+        lim.PermitLimit = 10;
         lim.Window = TimeSpan.FromMinutes(1);
     });
     opt.OnRejected = async (ctx, ct) =>
@@ -50,6 +59,7 @@ app.UseCors("Frontend");
 
 var api = app.MapGroup("/api/v1/ecommerce");
 api.MapProductEndpoints();
+api.MapOrderEndpoints();
 
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", ts = DateTime.UtcNow }));
 
