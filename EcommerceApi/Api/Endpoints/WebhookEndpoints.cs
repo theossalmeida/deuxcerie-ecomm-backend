@@ -19,16 +19,15 @@ public static class WebhookEndpoints
             HttpContext ctx,
             IDbConnection db,
             WebhookValidationService validator,
+            EmailService email,
             IConfiguration config,
             ILogger<Program> logger) =>
         {
             var receivedAt = DateTime.UtcNow;
 
-            // Reject non-JSON payloads before touching the body
             if (!ctx.Request.ContentType?.StartsWith("application/json", StringComparison.OrdinalIgnoreCase) ?? true)
                 return Results.BadRequest(new { error = "Content-Type deve ser application/json." });
 
-            // Read raw body BEFORE any parse — critical for HMAC
             ctx.Request.EnableBuffering();
             using var reader = new StreamReader(ctx.Request.Body, leaveOpen: true);
             var rawBody = await reader.ReadToEndAsync();
@@ -48,7 +47,7 @@ public static class WebhookEndpoints
                 return Results.Unauthorized();
             }
 
-            // CAMADA 2 — HMAC-SHA256 (temporariamente desabilitado para diagnóstico)
+            // CAMADA 2 — HMAC-SHA256
             var hmacKey = config["AbacatePay:HmacPublicKey"] ?? "";
             var signatureValid = validator.ValidateHmacSignature(rawBody, signatureHeader, hmacKey);
             if (!signatureValid)
@@ -68,15 +67,14 @@ public static class WebhookEndpoints
             }
 
             var eventType = payload?.Event;
-            // Support both payload shapes:
-            //   checkout.completed → data.checkout.id
-            //   billing.paid / pix.paid → data.billing.id
-            var billingId = payload?.Data?.Checkout?.Id ?? payload?.Data?.Billing?.Id;
+            var billingId = payload?.Data?.Checkout?.Id
+                ?? payload?.Data?.Billing?.Id
+                ?? payload?.Data?.Transparent?.Id;
 
             if (string.IsNullOrWhiteSpace(eventType) || string.IsNullOrWhiteSpace(billingId))
             {
                 await LogWebhook(db, receivedAt, eventType, rawBody, signatureHeader,
-                    true, true, "InvalidPayload", "event ou billing.id ausente", billingId, 200);
+                    true, true, "InvalidPayload", "event ou billing id ausente", billingId, 200);
                 return Results.Ok();
             }
 
@@ -91,14 +89,21 @@ public static class WebhookEndpoints
 
             var knownEvents = new[]
             {
-                "billing.paid",       // v1 billing — confirmed by llms.txt
-                "checkout.completed", // alternate name observed in sandbox
-                "pix.paid",           // PIX QR Code flow
-                "billing.refunded", "checkout.refunded",
-                "billing.disputed", "checkout.disputed",
-                "pix.expired",
-                "withdraw.paid"
+                // Success
+                "checkout.completed",
+                "transparent.completed",
+                // Refund
+                "checkout.refunded",
+                "transparent.refunded",
+                // Dispute
+                "checkout.disputed",
+                "transparent.disputed",
+                // Subscription
+                "subscription.completed",
+                "subscription.renewed",
+                "subscription.cancelled",
             };
+
             if (!knownEvents.Contains(eventType))
             {
                 await LogWebhook(db, receivedAt, eventType, rawBody, signatureHeader,
@@ -106,28 +111,30 @@ public static class WebhookEndpoints
                 return Results.Ok();
             }
 
-            // Process — always return 200 after valid HMAC
             try
             {
                 switch (eventType)
                 {
-                    case "billing.paid":
                     case "checkout.completed":
-                    case "pix.paid":
-                        await ProcessBillingPaid(db, config, logger, payload, billingId, receivedAt, eventType);
+                    case "transparent.completed":
+                    case "subscription.completed":
+                    case "subscription.renewed":
+                        await ProcessPaymentSuccessAsync(db, config, email, logger, payload, billingId, receivedAt, eventType);
                         break;
 
-                    case "billing.refunded":
                     case "checkout.refunded":
-                        await UpdateTransactionStatus(db, billingId, 4, "Pagamento estornado", eventType, receivedAt);
+                    case "transparent.refunded":
+                        await ProcessPaymentFailureAsync(db, email, logger, billingId, 4, "Pagamento estornado", eventType, receivedAt);
                         break;
 
-                    case "billing.disputed":
                     case "checkout.disputed":
-                        await UpdateTransactionStatus(db, billingId, 5, "Pagamento disputado", eventType, receivedAt);
+                    case "transparent.disputed":
+                        await ProcessPaymentFailureAsync(db, email, logger, billingId, 5, "Pagamento disputado", eventType, receivedAt);
                         break;
 
-                    // pix.expired and withdraw.paid are logged but need no order-level action
+                    case "subscription.cancelled":
+                        await UpdateTransactionStatus(db, billingId, 6, "Assinatura cancelada", eventType, receivedAt);
+                        break;
                 }
 
                 await LogWebhook(db, receivedAt, eventType, rawBody, signatureHeader,
@@ -147,14 +154,11 @@ public static class WebhookEndpoints
         return app;
     }
 
-    // Creates the order in the DB only after payment is confirmed.
-    // OrderStatus.Received = 4
-    private static async Task ProcessBillingPaid(
-        IDbConnection db, IConfiguration config, ILogger logger,
-        WebhookPayload payload, string billingId, DateTime receivedAt,
-        string eventType = "checkout.completed")
+    private static async Task ProcessPaymentSuccessAsync(
+        IDbConnection db, IConfiguration config, EmailService email, ILogger logger,
+        WebhookPayload payload, string billingId, DateTime receivedAt, string eventType)
     {
-        // CAMADA 4 — Idempotency: check if order was already created for this billing
+        // Idempotency
         var existingOrderId = await db.QueryFirstOrDefaultAsync<Guid?>(
             """
             SELECT pt."OrderId" FROM payment_transactions pt
@@ -164,12 +168,8 @@ public static class WebhookEndpoints
             new { BillingId = billingId });
 
         if (existingOrderId.HasValue)
-        {
-            // Already processed — idempotent
             return;
-        }
 
-        // Load checkout session
         var session = await db.QueryFirstOrDefaultAsync<CheckoutSessionRow>(
             """
             SELECT "Id", "AbacateBillingId", "AbacateCustomerId", "ClientName", "ClientMobile",
@@ -183,36 +183,40 @@ public static class WebhookEndpoints
 
         if (session is null)
         {
-            logger.LogWarning("billing.paid recebido para billing {BillingId} sem checkout_session correspondente", billingId);
+            logger.LogWarning("{Event} recebido para billing {BillingId} sem checkout_session correspondente", eventType, billingId);
             return;
         }
 
         if (session.UsedAt.HasValue)
+            return;
+
+        // CAMADA 5 — Amount + status validation (same rules for PIX and CARD)
+        // Both flows: verify id (already done via DB lookup), amount, and status == "PAID"
+        var transparent = payload.Data?.Transparent;
+        var checkout = payload.Data?.Checkout;
+        var billingData = payload.Data?.Billing;
+
+        var receivedAmount = transparent?.Amount ?? checkout?.Amount ?? billingData?.Amount;
+        var receivedStatus = transparent?.Status ?? checkout?.Status ?? billingData?.Status;
+
+        if (receivedAmount is null)
         {
-            // Session already consumed — duplicate webhook
+            logger.LogCritical("ALERTA CRÍTICO: amount ausente no webhook {Event} para billing {BillingId}", eventType, billingId);
             return;
         }
 
-        // CAMADA 5 — Amount validation
-        // Prefer data.payment.amount (present in all event types).
-        // Fall back to checkout.paidAmount / billing.paidAmount for older payload shapes.
-        var paidAmount = payload.Data?.Payment?.Amount
-            ?? payload.Data?.Checkout?.PaidAmount
-            ?? payload.Data?.Billing?.PaidAmount;
-
-        if (paidAmount is null)
-        {
-            logger.LogCritical(
-                "ALERTA CRÍTICO: paidAmount ausente no webhook checkout.completed para billing {BillingId}",
-                billingId);
-            return;
-        }
-
-        if (paidAmount.Value != session.AmountCents)
+        if (receivedAmount.Value != session.AmountCents)
         {
             logger.LogCritical(
                 "ALERTA CRÍTICO: valor divergente para billing {BillingId}. Esperado: {Expected}, Recebido: {Received}",
-                billingId, session.AmountCents, paidAmount.Value);
+                billingId, session.AmountCents, receivedAmount.Value);
+            return;
+        }
+
+        if (!string.Equals(receivedStatus, "PAID", StringComparison.OrdinalIgnoreCase))
+        {
+            logger.LogWarning("Webhook {Event} recebido mas status={Status} para billing {BillingId} — ignorado",
+                eventType, receivedStatus, billingId);
             return;
         }
 
@@ -232,7 +236,6 @@ public static class WebhookEndpoints
         {
             var now = DateTime.UtcNow;
 
-            // Find or create client
             var clientId = await conn.QueryFirstOrDefaultAsync<Guid?>(
                 """SELECT "Id" FROM clients WHERE "Name" = @Name AND "Mobile" = @Mobile LIMIT 1""",
                 new { Name = session.ClientName, Mobile = session.ClientMobile },
@@ -250,11 +253,9 @@ public static class WebhookEndpoints
                     transaction: tx);
             }
 
-            // Calculate totals
             long totalPaid = items.Sum(i => (long)i.Quantity * i.PaidPrice);
             long totalValue = items.Sum(i => (long)i.Quantity * i.BasePrice);
 
-            // Insert order — Status 4 = Received
             var orderId = Guid.CreateVersion7();
             using (var cmd = new NpgsqlCommand(
                 """
@@ -266,7 +267,7 @@ public static class WebhookEndpoints
                 cmd.Parameters.AddWithValue("Id", orderId);
                 cmd.Parameters.AddWithValue("ClientId", clientId.Value);
                 cmd.Parameters.AddWithValue("DeliveryDate", session.DeliveryDate);
-                cmd.Parameters.AddWithValue("Status", 4); // Received
+                cmd.Parameters.AddWithValue("Status", 4);
                 cmd.Parameters.AddWithValue("TotalPaid", totalPaid);
                 cmd.Parameters.AddWithValue("TotalValue", totalValue);
                 cmd.Parameters.AddWithValue("PaymentSource", "ECOMMERCE");
@@ -280,7 +281,6 @@ public static class WebhookEndpoints
                 await cmd.ExecuteNonQueryAsync();
             }
 
-            // Insert order items
             foreach (var item in items)
             {
                 await conn.ExecuteAsync(
@@ -304,15 +304,10 @@ public static class WebhookEndpoints
                     transaction: tx);
             }
 
-            // Insert payment_transaction
-            // Normalize: prefer checkout shape, fall back to billing shape
-            var checkout = payload.Data?.Checkout;
-            var billingData = payload.Data?.Billing;
             var customer = payload.Data?.Customer;
             var payerInfo = payload.Data?.PayerInformation;
             var payerPix = payerInfo?.PIX;
             var payerCard = payerInfo?.CARD;
-            // Method comes from payerInformation.method ("PIX" or "CARD")
             var paymentMethod = payerInfo?.Method ?? (payerCard != null ? "CARD" : "PIX");
 
             await conn.ExecuteAsync(
@@ -337,14 +332,12 @@ public static class WebhookEndpoints
                     AbacateBillingId = billingId,
                     AbacateCustomerId = session.AbacateCustomerId,
                     PaymentMethod = paymentMethod,
-                    Status = 2, // Paid
+                    Status = 2,
                     AmountCents = session.AmountCents,
-                    PaidAmountCents = payload.Data?.Payment?.Amount ?? checkout?.PaidAmount ?? billingData?.PaidAmount,
-                    PlatformFeeCents = payload.Data?.Payment?.Fee != 0 ? payload.Data?.Payment?.Fee : checkout?.PlatformFee ?? billingData?.PlatformFee,
+                    PaidAmountCents = payload.Data?.Payment?.Amount ?? checkout?.PaidAmount ?? transparent?.Amount ?? billingData?.PaidAmount,
+                    PlatformFeeCents = payload.Data?.Payment?.Fee != 0 ? payload.Data?.Payment?.Fee : checkout?.PlatformFee ?? transparent?.PlatformFee ?? billingData?.PlatformFee,
                     CheckoutUrl = session.CheckoutUrl,
-                    ReceiptUrl = checkout?.ReceiptUrl ?? billingData?.ReceiptUrl,
-                    // PIX: payer name from payerInformation.PIX.name, tax id from customer (masked)
-                    // CARD: payer name from customer.name
+                    ReceiptUrl = checkout?.ReceiptUrl ?? transparent?.ReceiptUrl ?? billingData?.ReceiptUrl,
                     PayerName = payerPix?.Name ?? customer?.Name,
                     PayerTaxIdMasked = customer?.TaxId,
                     CardLastFour = payerCard?.Number,
@@ -358,7 +351,6 @@ public static class WebhookEndpoints
                 },
                 transaction: tx);
 
-            // Mark session as consumed
             await conn.ExecuteAsync(
                 """UPDATE checkout_sessions SET "UsedAt" = @UsedAt WHERE "AbacateBillingId" = @BillingId""",
                 new { UsedAt = now, BillingId = billingId },
@@ -366,15 +358,44 @@ public static class WebhookEndpoints
 
             tx.Commit();
 
-            logger.LogInformation(
-                "Order {OrderId} created (Received) from checkout session {SessionId} — billing {BillingId}",
-                orderId, session.Id, billingId);
+            logger.LogInformation("Order {OrderId} created from billing {BillingId} [{Event}]", orderId, billingId, eventType);
+
+            // Send confirmation email (best-effort — never throw)
+            _ = email.SendOrderConfirmedAsync(session.Email, session.ClientName, orderId);
         }
         catch
         {
             tx.Rollback();
             throw;
         }
+    }
+
+    private static async Task ProcessPaymentFailureAsync(
+        IDbConnection db, EmailService email, ILogger logger,
+        string billingId, int status, string reason, string eventType, DateTime receivedAt)
+    {
+        await UpdateTransactionStatus(db, billingId, status, reason, eventType, receivedAt);
+
+        // Look up customer info to send notification email
+        var session = await db.QueryFirstOrDefaultAsync<(string Email, string ClientName)>(
+            """
+            SELECT cs."Email", cs."ClientName"
+            FROM checkout_sessions cs
+            WHERE cs."AbacateBillingId" = @BillingId
+            LIMIT 1
+            """,
+            new { BillingId = billingId });
+
+        if (session == default)
+        {
+            logger.LogWarning("Nenhuma session encontrada para billing {BillingId} ao enviar email de falha", billingId);
+            return;
+        }
+
+        if (status == 4)
+            _ = email.SendPaymentRefundedAsync(session.Email, session.ClientName);
+        else if (status == 5)
+            _ = email.SendPaymentDisputedAsync(session.Email, session.ClientName);
     }
 
     private static async Task UpdateTransactionStatus(
@@ -434,7 +455,6 @@ public static class WebhookEndpoints
             });
     }
 
-    // Dapper mapping row for checkout_sessions
     private record CheckoutSessionRow(
         Guid Id,
         string AbacateBillingId,

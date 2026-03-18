@@ -12,7 +12,8 @@ public record ProductDto(
     string? Size,
     int Price,
     bool ProductStatus,
-    string? AbacateStoreProductId
+    string? AbacateStoreProductId,
+    int? AbacateStoreProductPrice
 );
 
 public class ProductRepository(IDbConnection db)
@@ -20,7 +21,7 @@ public class ProductRepository(IDbConnection db)
     public async Task<IEnumerable<ProductDto>> GetActiveAsync() =>
         await db.QueryAsync<ProductDto>(
             """
-            SELECT "Id", "Name", "Description", "Image", "Category", "Size", "Price", "ProductStatus", "AbacateStoreProductId"
+            SELECT "Id", "Name", "Description", "Image", "Category", "Size", "Price", "ProductStatus", "AbacateStoreProductId", "AbacateStoreProductPrice"
             FROM products
             WHERE "ProductStatus" = true
             """);
@@ -28,14 +29,19 @@ public class ProductRepository(IDbConnection db)
     public async Task<ProductDto?> GetByIdAsync(Guid id) =>
         await db.QueryFirstOrDefaultAsync<ProductDto>(
             """
-            SELECT "Id", "Name", "Description", "Image", "Category", "Size", "Price", "ProductStatus", "AbacateStoreProductId"
+            SELECT "Id", "Name", "Description", "Image", "Category", "Size", "Price", "ProductStatus", "AbacateStoreProductId", "AbacateStoreProductPrice"
             FROM products
             WHERE "Id" = @Id
             """,
             new { Id = id });
 
-    public async Task UpdateAbacateProductIdAsync(Guid productId, string abacateProductId) =>
+    public async Task UpdateAbacateProductAsync(Guid productId, string abacateProductId, int cardPrice) =>
         await db.ExecuteAsync(
-            """UPDATE products SET "AbacateStoreProductId" = @AbacateStoreProductId WHERE "Id" = @Id""",
-            new { AbacateStoreProductId = abacateProductId, Id = productId });
+            """
+            UPDATE products
+            SET "AbacateStoreProductId" = @AbacateStoreProductId,
+                "AbacateStoreProductPrice" = @AbacateStoreProductPrice
+            WHERE "Id" = @Id
+            """,
+            new { AbacateStoreProductId = abacateProductId, AbacateStoreProductPrice = cardPrice, Id = productId });
 }

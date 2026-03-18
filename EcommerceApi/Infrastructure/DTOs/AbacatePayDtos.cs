@@ -20,13 +20,18 @@ public record CreateAbacateProductRequest(
 
 public record AbacateCheckoutItem(string Id, int Quantity);
 
-public record CreateAbacateCheckoutRequest(
+// PIX Transparent
+public record PixTransparentAmountData(long Amount);
+public record CreatePixTransparentRequest(string Method, PixTransparentAmountData Data);
+
+// Card Payment Link
+public record CreatePaymentLinkRequest(
+    string Frequency,
     AbacateCheckoutItem[] Items,
     string[] Methods,
-    string? CustomerId,
+    string? ExternalId,
     string? ReturnUrl,
-    string? CompletionUrl,
-    string? ExternalId
+    string? CompletionUrl
 );
 
 // ---------- Responses ----------
@@ -59,16 +64,24 @@ public record AbacateProductData(
 
 public record AbacateProductResponse(AbacateProductData? Data, string? Error);
 
-public record AbacateCheckoutData(
+// PIX Transparent response
+public record PixTransparentData(
     string Id,
-    string Url,
     long Amount,
-    long? PaidAmount,
     string Status,
-    bool DevMode
+    bool DevMode,
+    string BrCode,
+    string BrCodeBase64,
+    long PlatformFee,
+    DateTime ExpiresAt
 );
 
-public record AbacateCheckoutResponse(AbacateCheckoutData? Data, string? Error);
+public record PixTransparentResponse(PixTransparentData? Data, string? Error);
+
+// Card Payment Link response
+public record PaymentLinkData(string Id, string Url, long Amount, string Status, bool DevMode);
+
+public record PaymentLinkResponse(PaymentLinkData? Data, string? Error);
 
 // ---------- Webhook Payload ----------
 // Payload real (checkout.completed):
@@ -87,7 +100,7 @@ public record AbacateCheckoutResponse(AbacateCheckoutData? Data, string? Error);
 public record WebhookCheckoutData(
     string? Id,           // bill_xxx — used as billingId to match checkout_sessions
     long Amount,
-    long PaidAmount,
+    long? PaidAmount,
     long PlatformFee,
     string? ReceiptUrl,
     string? Status
@@ -106,7 +119,7 @@ public record WebhookPayerInformation(string? Method, WebhookPixPayerInfo? PIX, 
 public record WebhookBillingData(
     string? Id,
     long Amount,
-    long PaidAmount,
+    long? PaidAmount,
     long PlatformFee,
     string? ReceiptUrl,
     string? Status
@@ -114,9 +127,19 @@ public record WebhookBillingData(
 
 public record WebhookPaymentData(long Amount, long Fee, string? Method);
 
+public record WebhookTransparentData(
+    string? Id,
+    long Amount,
+    long? PaidAmount,   // null in transparent.completed — use Amount as fallback
+    long PlatformFee,
+    string? ReceiptUrl,
+    string? Status
+);
+
 public record WebhookEventData(
     WebhookCheckoutData? Checkout,
     WebhookBillingData? Billing,
+    WebhookTransparentData? Transparent,
     WebhookCustomerData? Customer,
     WebhookPayerInformation? PayerInformation,
     WebhookPaymentData? Payment

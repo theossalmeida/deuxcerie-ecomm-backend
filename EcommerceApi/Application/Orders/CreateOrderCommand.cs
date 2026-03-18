@@ -15,7 +15,16 @@ public record CreateOrderCommand(
     string Email,
     string TaxId,
     DateTime DeliveryDate,
-    IReadOnlyList<OrderItemCommand> Items);
+    IReadOnlyList<OrderItemCommand> Items,
+    string PaymentMethod);
 
 // sessionId = checkout_sessions.Id — the actual orderId is assigned after payment confirmation
-public record CreateOrderResult(Guid SessionId, string CheckoutUrl);
+public record CreateOrderResult(
+    Guid SessionId,
+    string PaymentMethod,
+    // Card
+    string? CheckoutUrl,
+    // PIX
+    string? BrCode,
+    string? BrCodeBase64,
+    DateTime? ExpiresAt);

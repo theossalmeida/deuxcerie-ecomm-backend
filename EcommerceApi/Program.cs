@@ -75,6 +75,7 @@ builder.Services.AddScoped<ProductRepository>();
 builder.Services.AddScoped<StorageService>();
 builder.Services.AddScoped<CreateOrderHandler>();
 builder.Services.AddScoped<AbacatePayService>();
+builder.Services.AddScoped<EmailService>();
 builder.Services.AddSingleton<WebhookValidationService>();
 
 builder.Services.AddHttpClient("AbacatePay", client =>
@@ -83,6 +84,17 @@ builder.Services.AddHttpClient("AbacatePay", client =>
     client.DefaultRequestHeaders.Add("Authorization", $"Bearer {apiToken}");
     client.DefaultRequestHeaders.Add("Accept", "application/json");
     client.Timeout = TimeSpan.FromSeconds(30);
+});
+
+var resendToken = builder.Configuration["Resend:ApiToken"]
+    ?? throw new InvalidOperationException("Resend:ApiToken não configurado.");
+
+builder.Services.AddHttpClient("Resend", client =>
+{
+    client.BaseAddress = new Uri("https://api.resend.com");
+    client.DefaultRequestHeaders.Add("Authorization", $"Bearer {resendToken}");
+    client.DefaultRequestHeaders.Add("Accept", "application/json");
+    client.Timeout = TimeSpan.FromSeconds(15);
 });
 
 builder.Services.AddRateLimiter(opt =>

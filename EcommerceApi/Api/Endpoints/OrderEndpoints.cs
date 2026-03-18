@@ -25,12 +25,13 @@ public static class OrderEndpoints
             var form = await request.ReadFormAsync();
 
             // Trim all text inputs — prevents leading/trailing whitespace attacks
-            var clientName    = form["clientName"].ToString().Trim();
-            var clientMobile  = form["clientMobile"].ToString().Trim();
-            var email         = form["email"].ToString().Trim();
-            var taxId         = form["taxId"].ToString().Trim();
+            var clientName      = form["clientName"].ToString().Trim();
+            var clientMobile    = form["clientMobile"].ToString().Trim();
+            var email           = form["email"].ToString().Trim();
+            var taxId           = form["taxId"].ToString().Trim();
             var deliveryDateRaw = form["deliveryDate"].ToString().Trim();
-            var itemsJson     = form["items"].ToString().Trim();
+            var itemsJson       = form["items"].ToString().Trim();
+            var paymentMethod   = form["paymentMethod"].ToString().Trim().ToUpperInvariant();
 
             // Required field presence
             if (string.IsNullOrWhiteSpace(clientName))
@@ -43,6 +44,8 @@ public static class OrderEndpoints
                 return Results.BadRequest(new { error = "O campo 'taxId' (CPF) é obrigatório." });
             if (string.IsNullOrWhiteSpace(itemsJson))
                 return Results.BadRequest(new { error = "O campo 'items' é obrigatório." });
+            if (paymentMethod != "PIX" && paymentMethod != "CARD")
+                return Results.BadRequest(new { error = "O campo 'paymentMethod' deve ser 'PIX' ou 'CARD'." });
 
             // Length caps — prevents oversized payloads reaching business logic
             if (clientName.Length > 200)
@@ -126,13 +129,23 @@ public static class OrderEndpoints
             try
             {
                 var result = await handler.HandleAsync(
-                    new CreateOrderCommand(clientName, clientMobile, email, taxId, deliveryDate, items));
+                    new CreateOrderCommand(clientName, clientMobile, email, taxId, deliveryDate, items, paymentMethod));
 
-                return Results.Ok(new
-                {
-                    sessionId   = result.SessionId,
-                    checkoutUrl = result.CheckoutUrl
-                });
+                return result.PaymentMethod == "PIX"
+                    ? Results.Ok(new
+                    {
+                        sessionId    = result.SessionId,
+                        paymentMethod = result.PaymentMethod,
+                        brCode       = result.BrCode,
+                        brCodeBase64 = result.BrCodeBase64,
+                        expiresAt    = result.ExpiresAt
+                    })
+                    : Results.Ok(new
+                    {
+                        sessionId     = result.SessionId,
+                        paymentMethod = result.PaymentMethod,
+                        checkoutUrl   = result.CheckoutUrl
+                    });
             }
             catch (ArgumentException ex)
             {

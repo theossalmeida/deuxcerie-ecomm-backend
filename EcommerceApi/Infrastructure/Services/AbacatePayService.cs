@@ -13,31 +13,6 @@ public class AbacatePayService(
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
     };
 
-    public async Task<AbacateCustomerResponse?> CreateCustomerAsync(
-        string name, string cellphone, string email, string taxId)
-    {
-        var client = httpClientFactory.CreateClient("AbacatePay");
-        try
-        {
-            var body = new CreateAbacateCustomerRequest(name, cellphone, email, taxId);
-            var response = await client.PostAsJsonAsync("/v2/customers/create", body, _json);
-            var content = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
-            {
-                logger.LogError("AbacatePay CreateCustomer falhou {Status}: {Body}",
-                    response.StatusCode, content);
-                return null;
-            }
-            return JsonSerializer.Deserialize<AbacateCustomerResponse>(content, _json);
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "AbacatePay CreateCustomer exception");
-            return null;
-        }
-    }
-
     public async Task<AbacateProductResponse?> CreateProductAsync(
         Guid externalId, string name, int priceCents, string? description)
     {
@@ -57,8 +32,7 @@ public class AbacatePayService(
 
             if (!response.IsSuccessStatusCode)
             {
-                logger.LogError("AbacatePay CreateProduct falhou {Status}: {Body}",
-                    response.StatusCode, content);
+                logger.LogError("AbacatePay CreateProduct falhou {Status}: {Body}", response.StatusCode, content);
                 return null;
             }
             return JsonSerializer.Deserialize<AbacateProductResponse>(content, _json);
@@ -70,23 +44,65 @@ public class AbacatePayService(
         }
     }
 
-    public async Task<AbacateCheckoutResponse?> CreateCheckoutAsync(CreateAbacateCheckoutRequest request)
+    public async Task DeleteProductAsync(string abacateProductId)
     {
         var client = httpClientFactory.CreateClient("AbacatePay");
         try
         {
-            var response = await client.PostAsJsonAsync("/v2/checkouts/create", request, _json);
-            var content = await response.Content.ReadAsStringAsync();
+            var response = await client.DeleteAsync($"/v2/products/delete?id={abacateProductId}");
             if (!response.IsSuccessStatusCode)
             {
-                logger.LogError("AbacatePay CreateCheckout falhou {Status}: {Body}", response.StatusCode, content);
-                return null;
+                var content = await response.Content.ReadAsStringAsync();
+                logger.LogWarning("AbacatePay DeleteProduct falhou {Status}: {Body}", response.StatusCode, content);
             }
-            return JsonSerializer.Deserialize<AbacateCheckoutResponse>(content, _json);
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "AbacatePay CreateCheckout exception");
+            logger.LogWarning(ex, "AbacatePay DeleteProduct exception para {Id}", abacateProductId);
+        }
+    }
+
+    public async Task<PixTransparentResponse?> CreatePixTransparentAsync(long amountCents)
+    {
+        var client = httpClientFactory.CreateClient("AbacatePay");
+        try
+        {
+            var body = new CreatePixTransparentRequest("PIX", new PixTransparentAmountData(amountCents));
+            var response = await client.PostAsJsonAsync("/v2/transparents/create", body, _json);
+            var content = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                logger.LogError("AbacatePay CreatePixTransparent falhou {Status}: {Body}", response.StatusCode, content);
+                return null;
+            }
+            return JsonSerializer.Deserialize<PixTransparentResponse>(content, _json);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "AbacatePay CreatePixTransparent exception");
+            return null;
+        }
+    }
+
+    public async Task<PaymentLinkResponse?> CreatePaymentLinkAsync(CreatePaymentLinkRequest request)
+    {
+        var client = httpClientFactory.CreateClient("AbacatePay");
+        try
+        {
+            var response = await client.PostAsJsonAsync("/v2/payment-links/create", request, _json);
+            var content = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                logger.LogError("AbacatePay CreatePaymentLink falhou {Status}: {Body}", response.StatusCode, content);
+                return null;
+            }
+            return JsonSerializer.Deserialize<PaymentLinkResponse>(content, _json);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "AbacatePay CreatePaymentLink exception");
             return null;
         }
     }

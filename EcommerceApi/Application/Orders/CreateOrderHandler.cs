@@ -41,10 +41,11 @@ public class CreateOrderHandler(
             }
         }
 
-        // 2. Validate products and calculate totals (critical security check — before charging)
-        long amountCents = 0;
+        // 2. Validate products and calculate base totals (critical security check — before charging)
+        long baseCents = 0;
         var itemSnapshots = new List<CheckoutItemSnapshot>();
-        var checkoutItems = new List<AbacateCheckoutItem>();
+        var cardCheckoutItems = new List<AbacateCheckoutItem>();
+        long cardAmountCents = 0;
 
         foreach (var item in command.Items)
         {
@@ -53,39 +54,128 @@ public class CreateOrderHandler(
             if (product is null || !product.ProductStatus)
                 throw new InvalidOperationException($"Produto {item.ProductId} não encontrado ou inativo.");
 
-            if (item.PaidPrice < product.Price)
+            var expectedPrice = command.PaymentMethod == "CARD"
+                ? (int)Math.Round(product.Price * 1.05)
+                : product.Price;
+
+            if (item.PaidPrice < expectedPrice)
                 throw new InvalidOperationException(
                     $"O preço do produto {item.ProductId} mudou. Por favor, atualize seu carrinho.");
 
             if (product.Price == 0)
                 throw new InvalidOperationException($"Preço inválido para o produto {item.ProductId}.");
 
-            // Ensure product exists in AbacatePay (lazy sync on first use)
-            var abacateProductId = product.AbacateStoreProductId;
-            if (abacateProductId is null)
-            {
-                var productResponse = await abacatePay.CreateProductAsync(
-                    product.Id, product.Name, product.Price, product.Description);
+            baseCents += (long)item.Quantity * product.Price;
 
-                if (productResponse?.Data is null)
+            if (command.PaymentMethod == "CARD")
+            {
+                var cardPrice = (int)Math.Round(product.Price * 1.05);
+                cardAmountCents += (long)item.Quantity * cardPrice;
+                itemSnapshots.Add(new CheckoutItemSnapshot(
+                    item.ProductId, product.Name, item.Quantity,
+                    cardPrice, product.Price, item.Observation));
+
+                var abacateProductId = product.AbacateStoreProductId;
+                var priceOutdated = product.AbacateStoreProductPrice != cardPrice;
+
+                if (abacateProductId is null || priceOutdated)
                 {
-                    logger.LogError("Falha ao criar produto {ProductId} no AbacatePay", product.Id);
-                    throw new PaymentGatewayException("Falha ao processar pagamento. Tente novamente.");
+                    if (priceOutdated && abacateProductId is not null)
+                    {
+                        logger.LogInformation(
+                            "Preço do produto {ProductId} mudou ({Old} → {New}), recriando no AbacatePay",
+                            product.Id, product.AbacateStoreProductPrice, cardPrice);
+                        await abacatePay.DeleteProductAsync(abacateProductId);
+                    }
+
+                    var productResponse = await abacatePay.CreateProductAsync(
+                        product.Id, product.Name, cardPrice, product.Description);
+
+                    if (productResponse?.Data is null)
+                    {
+                        logger.LogError("Falha ao criar produto {ProductId} no AbacatePay", product.Id);
+                        throw new PaymentGatewayException("Falha ao processar pagamento. Tente novamente.");
+                    }
+
+                    abacateProductId = productResponse.Data.Id;
+                    await productRepo.UpdateAbacateProductAsync(product.Id, abacateProductId, cardPrice);
                 }
 
-                abacateProductId = productResponse.Data.Id;
-                await productRepo.UpdateAbacateProductIdAsync(product.Id, abacateProductId);
+                cardCheckoutItems.Add(new AbacateCheckoutItem(abacateProductId, item.Quantity));
             }
-
-            amountCents += (long)item.Quantity * product.Price;
-            itemSnapshots.Add(new CheckoutItemSnapshot(
-                item.ProductId, product.Name, item.Quantity,
-                product.Price, product.Price, item.Observation));
-            checkoutItems.Add(new AbacateCheckoutItem(abacateProductId, item.Quantity));
+            else
+            {
+                itemSnapshots.Add(new CheckoutItemSnapshot(
+                    item.ProductId, product.Name, item.Quantity,
+                    product.Price, product.Price, item.Observation));
+            }
         }
 
-        // 3. Dedup — if this exact cart was submitted in the last 5 minutes, return the existing session.
-        //    Prevents double-charging when the frontend retries due to a timeout or network error.
+        var devMode = bool.Parse(config["AbacatePay:DevMode"] ?? "false");
+        var itemsJson = JsonSerializer.Serialize(itemSnapshots, _json);
+        var refsJson = allReferenceKeys.Count > 0 ? JsonSerializer.Serialize(allReferenceKeys, _json) : null;
+
+        if (command.PaymentMethod == "PIX")
+            return await HandlePixAsync(command, sessionId, baseCents, itemsJson, refsJson, devMode);
+        else
+            return await HandleCardAsync(command, sessionId, baseCents, cardAmountCents, cardCheckoutItems, itemsJson, refsJson, devMode);
+    }
+
+    private async Task<CreateOrderResult> HandlePixAsync(
+        CreateOrderCommand command, Guid sessionId,
+        long baseCents, string itemsJson, string? refsJson, bool devMode)
+    {
+        var pixAmount = baseCents;
+
+        var pixResponse = await abacatePay.CreatePixTransparentAsync(pixAmount);
+
+        if (pixResponse?.Data is null)
+        {
+            logger.LogError("Falha ao criar PIX transparent AbacatePay");
+            throw new PaymentGatewayException("Falha ao processar pagamento. Tente novamente.");
+        }
+
+        var pix = pixResponse.Data;
+
+        await db.ExecuteAsync(
+            """
+            INSERT INTO checkout_sessions
+                ("Id", "AbacateBillingId", "AbacateCustomerId", "ClientName", "ClientMobile",
+                 "Email", "TaxId", "DeliveryDate", "ItemsJson", "ReferencesJson",
+                 "AmountCents", "CheckoutUrl", "DevMode", "CreatedAt")
+            VALUES
+                (@Id, @AbacateBillingId, NULL, @ClientName, @ClientMobile,
+                 @Email, @TaxId, @DeliveryDate, @ItemsJson, @ReferencesJson,
+                 @AmountCents, NULL, @DevMode, @CreatedAt)
+            """,
+            new
+            {
+                Id = sessionId,
+                AbacateBillingId = pix.Id,
+                ClientName = command.ClientName,
+                ClientMobile = command.ClientMobile,
+                Email = command.Email,
+                TaxId = command.TaxId,
+                DeliveryDate = command.DeliveryDate,
+                ItemsJson = itemsJson,
+                ReferencesJson = refsJson,
+                AmountCents = pixAmount,
+                DevMode = devMode,
+                CreatedAt = DateTime.UtcNow
+            });
+
+        logger.LogInformation("PIX session {SessionId} created — transparent {PixId}", sessionId, pix.Id);
+
+        return new CreateOrderResult(sessionId, "PIX", null, pix.BrCode, pix.BrCodeBase64, pix.ExpiresAt);
+    }
+
+    private async Task<CreateOrderResult> HandleCardAsync(
+        CreateOrderCommand command, Guid sessionId,
+        long baseCents, long cardAmountCents,
+        List<AbacateCheckoutItem> checkoutItems,
+        string itemsJson, string? refsJson, bool devMode)
+    {
+        // Dedup — same cart submitted twice in 5 minutes
         var recent = await db.QueryFirstOrDefaultAsync<(Guid Id, string? CheckoutUrl)>(
             """
             SELECT "Id", "CheckoutUrl"
@@ -96,52 +186,32 @@ public class CreateOrderHandler(
               AND "CreatedAt"    > @Threshold
             LIMIT 1
             """,
-            new { Mobile = command.ClientMobile, Amount = amountCents, Threshold = DateTime.UtcNow.AddMinutes(-5) });
+            new { Mobile = command.ClientMobile, Amount = cardAmountCents, Threshold = DateTime.UtcNow.AddMinutes(-5) });
 
         if (recent.Id != default)
         {
-            logger.LogInformation("Returning existing checkout session {SessionId} for {Mobile}", recent.Id, command.ClientMobile);
-            return new CreateOrderResult(recent.Id, recent.CheckoutUrl!);
+            logger.LogInformation("Returning existing card session {SessionId} for {Mobile}", recent.Id, command.ClientMobile);
+            return new CreateOrderResult(recent.Id, "CARD", recent.CheckoutUrl!, null, null, null);
         }
 
-        // 4. Create customer in AbacatePay
-        var customerResponse = await abacatePay.CreateCustomerAsync(
-            command.ClientName, command.ClientMobile, command.Email, command.TaxId);
-
-        if (customerResponse?.Data is null)
-        {
-            logger.LogError("Falha ao criar customer AbacatePay");
-            throw new PaymentGatewayException("Falha ao processar pagamento. Tente novamente.");
-        }
-
-        var abacateCustomerId = customerResponse.Data.Id;
-
-        // 5. Create checkout in AbacatePay
-        var checkoutRequest = new CreateAbacateCheckoutRequest(
+        var linkRequest = new CreatePaymentLinkRequest(
+            Frequency: "MULTIPLE_PAYMENTS",
             Items: checkoutItems.ToArray(),
-            Methods: ["PIX", "CARD"],
-            CustomerId: abacateCustomerId,
+            Methods: ["CARD"],
+            ExternalId: sessionId.ToString(),
             ReturnUrl: $"{config["AbacatePay:ReturnUrl"]}?session={sessionId}",
-            CompletionUrl: config["AbacatePay:CompletionUrl"]!,
-            ExternalId: sessionId.ToString()
+            CompletionUrl: config["AbacatePay:CompletionUrl"]!
         );
 
-        var checkoutResponse = await abacatePay.CreateCheckoutAsync(checkoutRequest);
+        var linkResponse = await abacatePay.CreatePaymentLinkAsync(linkRequest);
 
-        if (checkoutResponse?.Data is null)
+        if (linkResponse?.Data is null)
         {
-            logger.LogError("Falha ao criar checkout AbacatePay");
+            logger.LogError("Falha ao criar payment link AbacatePay");
             throw new PaymentGatewayException("Falha ao processar pagamento. Tente novamente.");
         }
 
-        var billingData = checkoutResponse.Data;
-
-        // 6. Persist checkout session — the order will be created only after webhook confirmation
-        var devMode = bool.Parse(config["AbacatePay:DevMode"] ?? "false");
-        var itemsJson = JsonSerializer.Serialize(itemSnapshots, _json);
-        var refsJson = allReferenceKeys.Count > 0
-            ? JsonSerializer.Serialize(allReferenceKeys, _json)
-            : null;
+        var link = linkResponse.Data;
 
         await db.ExecuteAsync(
             """
@@ -150,15 +220,14 @@ public class CreateOrderHandler(
                  "Email", "TaxId", "DeliveryDate", "ItemsJson", "ReferencesJson",
                  "AmountCents", "CheckoutUrl", "DevMode", "CreatedAt")
             VALUES
-                (@Id, @AbacateBillingId, @AbacateCustomerId, @ClientName, @ClientMobile,
+                (@Id, @AbacateBillingId, NULL, @ClientName, @ClientMobile,
                  @Email, @TaxId, @DeliveryDate, @ItemsJson, @ReferencesJson,
                  @AmountCents, @CheckoutUrl, @DevMode, @CreatedAt)
             """,
             new
             {
                 Id = sessionId,
-                AbacateBillingId = billingData.Id,
-                AbacateCustomerId = abacateCustomerId,
+                AbacateBillingId = link.Id,
                 ClientName = command.ClientName,
                 ClientMobile = command.ClientMobile,
                 Email = command.Email,
@@ -166,15 +235,15 @@ public class CreateOrderHandler(
                 DeliveryDate = command.DeliveryDate,
                 ItemsJson = itemsJson,
                 ReferencesJson = refsJson,
-                AmountCents = amountCents,
-                CheckoutUrl = billingData.Url,
+                AmountCents = cardAmountCents,
+                CheckoutUrl = link.Url,
                 DevMode = devMode,
                 CreatedAt = DateTime.UtcNow
             });
 
-        logger.LogInformation("Checkout session {SessionId} created for billing {BillingId}", sessionId, billingData.Id);
+        logger.LogInformation("Card session {SessionId} created — payment link {LinkId}", sessionId, link.Id);
 
-        return new CreateOrderResult(sessionId, billingData.Url);
+        return new CreateOrderResult(sessionId, "CARD", link.Url, null, null, null);
     }
 
     private static void Validate(CreateOrderCommand cmd)
@@ -194,6 +263,8 @@ public class CreateOrderHandler(
             throw new ArgumentException($"Data de entrega mínima é {minDeliveryDate:dd/MM/yyyy}.");
         if (cmd.Items.Count == 0)
             throw new ArgumentException("O pedido deve ter pelo menos 1 item.");
+        if (cmd.PaymentMethod != "PIX" && cmd.PaymentMethod != "CARD")
+            throw new ArgumentException("paymentMethod deve ser 'PIX' ou 'CARD'.");
 
         foreach (var item in cmd.Items)
         {
