@@ -56,13 +56,15 @@ public class CreateOrderHandler(
                 throw new InvalidOperationException(
                     $"O preço do produto {item.ProductId} mudou. Por favor, atualize seu carrinho.");
 
-            if (item.PaidPrice == 0 && product.Price > 0)
+            if (product.Price == 0)
                 throw new InvalidOperationException($"Preço inválido para o produto {item.ProductId}.");
 
-            amountCents += (long)item.Quantity * item.PaidPrice;
+            // Use BasePrice for AbacatePay — keeps the product price stable across billings.
+            // PaidPrice is validated above (must be >= BasePrice) but the charge is always BasePrice.
+            amountCents += (long)item.Quantity * product.Price;
             itemSnapshots.Add(new CheckoutItemSnapshot(
                 item.ProductId, product.Name, item.Quantity,
-                item.PaidPrice, product.Price, item.Observation));
+                product.Price, product.Price, item.Observation));
         }
 
         // 3. Dedup — if this exact cart was submitted in the last 5 minutes, return the existing session.
@@ -97,18 +99,18 @@ public class CreateOrderHandler(
 
         var abacateCustomerId = customerResponse.Data.Id;
 
-        // 4. Create billing in AbacatePay
+        // 5. Create billing in AbacatePay
         var billingRequest = new CreateAbacateBillingRequest(
             Frequency: "ONE_TIME",
             Methods: ["PIX", "CARD"],
-            Products: itemSnapshots.Select(s => new AbacateBillingProductRequest(
-                ExternalId: s.ProductId.ToString(),
+            Products: itemSnapshots.Select((s, i) => new AbacateBillingProductRequest(
+                ExternalId: $"{s.ProductId}_{sessionId}",
                 Name: s.Name,
-                Description: null,
+                Description: "",
                 Quantity: s.Quantity,
-                Price: s.PaidPrice
+                Price: s.BasePrice
             )).ToArray(),
-            ReturnUrl: config["AbacatePay:ReturnUrl"]!,
+            ReturnUrl: $"{config["AbacatePay:ReturnUrl"]}?session={sessionId}",
             CompletionUrl: config["AbacatePay:CompletionUrl"]!,
             CustomerId: abacateCustomerId
         );
@@ -122,32 +124,6 @@ public class CreateOrderHandler(
         }
 
         var billingData = billingResponse.Data;
-
-        // 5. Store AbacateStoreProductId best-effort
-        if (billingData.Products != null)
-        {
-            foreach (var bp in billingData.Products)
-            {
-                if (Guid.TryParse(bp.ExternalId, out var localProductId))
-                {
-                    try
-                    {
-                        await db.ExecuteAsync(
-                            """
-                            UPDATE products
-                            SET "AbacateStoreProductId" = @AbacateId
-                            WHERE "Id" = @LocalId
-                              AND "AbacateStoreProductId" IS NULL
-                            """,
-                            new { AbacateId = bp.Id, LocalId = localProductId });
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogWarning(ex, "Falha ao salvar AbacateStoreProductId para produto {ProductId}", localProductId);
-                    }
-                }
-            }
-        }
 
         // 6. Persist checkout session — the order will be created only after webhook confirmation
         var devMode = bool.Parse(config["AbacatePay:DevMode"] ?? "false");
@@ -202,6 +178,9 @@ public class CreateOrderHandler(
             throw new ArgumentException("taxId (CPF) é obrigatório.");
         if (cmd.DeliveryDate == default)
             throw new ArgumentException("deliveryDate inválido.");
+        var minDeliveryDate = DateTime.UtcNow.Date.AddDays(2);
+        if (cmd.DeliveryDate.Date < minDeliveryDate)
+            throw new ArgumentException($"Data de entrega mínima é {minDeliveryDate:dd/MM/yyyy}.");
         if (cmd.Items.Count == 0)
             throw new ArgumentException("O pedido deve ter pelo menos 1 item.");
 

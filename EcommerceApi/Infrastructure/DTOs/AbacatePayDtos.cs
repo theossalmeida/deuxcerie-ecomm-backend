@@ -45,16 +45,7 @@ public record AbacateCustomerResponse(
     string? Error
 );
 
-public record AbacateBillingProductResponse(
-    string Id,
-    string ExternalId,
-    int Quantity
-);
-
-public record AbacateBillingCustomerResponse(
-    string Id,
-    AbacateCustomerMetadata? Metadata
-);
+public record AbacateBillingProductResponse(string Id, string ExternalId, int Quantity);
 
 public record AbacateBillingData(
     string Id,
@@ -62,35 +53,61 @@ public record AbacateBillingData(
     long Amount,
     string Status,
     bool DevMode,
-    string[] Methods,
-    AbacateBillingProductResponse[]? Products,
-    string Frequency,
-    AbacateBillingCustomerResponse? Customer,
-    DateTime CreatedAt,
-    DateTime UpdatedAt
+    AbacateBillingProductResponse[]? Products
 );
 
-public record AbacateBillingResponse(
-    AbacateBillingData? Data,
-    string? Error
-);
+public record AbacateBillingResponse(AbacateBillingData? Data, string? Error);
 
 // ---------- Webhook Payload ----------
+// Payload real (checkout.completed):
+// {
+//   "event": "checkout.completed",
+//   "apiVersion": 2,
+//   "devMode": false,
+//   "data": {
+//     "checkout": { "id": "bill_xxx", "amount": 10000, "paidAmount": 10000, "platformFee": 80, "status": "PAID", ... },
+//     "customer": { "id": "cust_xxx", "name": "...", "email": "...", "taxId": "123.***.***-**" },
+//     "payerInformation": { "method": "PIX", "PIX": { "name": "...", "isSameAsCustomer": true } }
+//                      OR  { "method": "CARD", "CARD": { "number": "1234", "brand": "Visa" } }
+//   }
+// }
 
-public record WebhookBillingData(string Id, long Amount, string Status);
+public record WebhookCheckoutData(
+    string? Id,           // bill_xxx — used as billingId to match checkout_sessions
+    long Amount,
+    long PaidAmount,
+    long PlatformFee,
+    string? ReceiptUrl,
+    string? Status
+);
 
-public record WebhookCheckoutData(long PaidAmount, long PlatformFee, string? ReceiptUrl);
+public record WebhookCustomerData(string? Id, string? Name, string? Email, string? TaxId);
 
-public record WebhookPixPayerInfo(string? Name, string? TaxId);
+public record WebhookPixPayerInfo(string? Name, bool? IsSameAsCustomer);
 
 public record WebhookCardPayerInfo(string? Number, string? Brand);
 
-public record WebhookPayerInformation(WebhookPixPayerInfo? PIX, WebhookCardPayerInfo? CARD);
+public record WebhookPayerInformation(string? Method, WebhookPixPayerInfo? PIX, WebhookCardPayerInfo? CARD);
+
+// billing.paid uses data.billing.id; checkout.completed uses data.checkout.id
+// We map both to handle whichever event AbacatePay actually fires
+public record WebhookBillingData(
+    string? Id,
+    long Amount,
+    long PaidAmount,
+    long PlatformFee,
+    string? ReceiptUrl,
+    string? Status
+);
+
+public record WebhookPaymentData(long Amount, long Fee, string? Method);
 
 public record WebhookEventData(
-    WebhookBillingData? Billing,
     WebhookCheckoutData? Checkout,
-    WebhookPayerInformation? PayerInformation
+    WebhookBillingData? Billing,
+    WebhookCustomerData? Customer,
+    WebhookPayerInformation? PayerInformation,
+    WebhookPaymentData? Payment
 );
 
 public record WebhookPayload(string Event, int ApiVersion, bool DevMode, WebhookEventData? Data);

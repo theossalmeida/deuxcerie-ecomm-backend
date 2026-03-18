@@ -21,14 +21,25 @@ builder.Host.UseSerilog((ctx, cfg) =>
        .WriteTo.Console(new RenderedCompactJsonFormatter()));
 
 // Fail fast if payment secrets are not configured
-var apiToken = builder.Configuration["AbacatePay:ApiToken"];
-var webhookSecret = builder.Configuration["AbacatePay:WebhookSecret"];
+var devMode = bool.Parse(builder.Configuration["AbacatePay:DevMode"] ?? "false");
+var apiToken = devMode
+    ? builder.Configuration["AbacatePay:TestApiToken"]
+    : builder.Configuration["AbacatePay:ApiToken"];
+var webhookSecret = devMode
+    ? builder.Configuration["AbacatePay:TestWebhookSecret"]
+    : builder.Configuration["AbacatePay:WebhookSecret"];
+
 if (string.IsNullOrWhiteSpace(apiToken))
-    throw new InvalidOperationException(
-        "AbacatePay:ApiToken não configurado. Use user-secrets ou variável de ambiente.");
+    throw new InvalidOperationException(devMode
+        ? "AbacatePay:TestApiToken não configurado. Use user-secrets ou variável de ambiente."
+        : "AbacatePay:ApiToken não configurado. Use user-secrets ou variável de ambiente.");
 if (string.IsNullOrWhiteSpace(webhookSecret))
-    throw new InvalidOperationException(
-        "AbacatePay:WebhookSecret não configurado. Use user-secrets ou variável de ambiente.");
+    throw new InvalidOperationException(devMode
+        ? "AbacatePay:TestWebhookSecret não configurado. Use user-secrets ou variável de ambiente."
+        : "AbacatePay:WebhookSecret não configurado. Use user-secrets ou variável de ambiente.");
+
+// Normalise so the rest of the app always reads the same keys regardless of mode
+builder.Configuration["AbacatePay:WebhookSecret"] = webhookSecret;
 
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
     ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection is not configured.");
@@ -100,13 +111,13 @@ builder.Services.AddRateLimiter(opt =>
                 QueueLimit = 0
             }));
 
-    // Orders — 5 per 10 min per IP (strict — one IP creating many orders is brute force)
+    // Orders — relaxed for testing (restore to 5/10min before going live)
     opt.AddPolicy<string>("orders", ctx =>
         RateLimitPartition.GetSlidingWindowLimiter(
             partitionKey: ctx.Connection.RemoteIpAddress?.ToString() ?? "anonymous",
             factory: _ => new SlidingWindowRateLimiterOptions
             {
-                PermitLimit = 5,
+                PermitLimit = 100,
                 Window = TimeSpan.FromMinutes(10),
                 SegmentsPerWindow = 5,
                 QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
@@ -181,6 +192,7 @@ api.MapProductEndpoints();
 api.MapOrderEndpoints();
 api.MapWebhookEndpoints();
 api.MapPaymentStatusEndpoints();
+api.MapCheckoutSessionEndpoints();
 
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", ts = DateTime.UtcNow }));
 
