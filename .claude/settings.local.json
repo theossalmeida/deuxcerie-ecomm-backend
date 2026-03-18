@@ -4,7 +4,8 @@
       "Bash(find /c/Projetos/Deuxcerie/deuxcerie-backend -not -path */bin/* -not -path */obj/* -not -path */.vs/* -not -path */.git/* -type f)",
       "Bash(xargs grep:*)",
       "WebFetch(domain:docs.abacatepay.com)",
-      "Bash(dotnet build:*)"
+      "Bash(dotnet build:*)",
+      "Read(//c/Users/theoa/.claude/projects/C--Projetos-Deuxcerie-deuxcerie-backend/**)"
     ]
   }
 }

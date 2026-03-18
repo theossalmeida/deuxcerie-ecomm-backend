@@ -28,10 +28,17 @@ public static class WebhookEndpoints
             if (!ctx.Request.ContentType?.StartsWith("application/json", StringComparison.OrdinalIgnoreCase) ?? true)
                 return Results.BadRequest(new { error = "Content-Type deve ser application/json." });
 
+            // Limit webhook body to 1 MB (prevents memory DoS)
+            ctx.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpMaxRequestBodySizeFeature>()
+                ?.MaxRequestBodySize = 1 * 1024 * 1024;
+
             ctx.Request.EnableBuffering();
             using var reader = new StreamReader(ctx.Request.Body, leaveOpen: true);
             var rawBody = await reader.ReadToEndAsync();
             ctx.Request.Body.Position = 0;
+
+            // Sanitized copy for logging (removes customer PII)
+            var sanitizedBody = SanitizeWebhookPayload(rawBody);
 
             var signatureHeader = ctx.Request.Headers["X-Webhook-Signature"].ToString();
 
@@ -42,18 +49,12 @@ public static class WebhookEndpoints
 
             if (!secretValid)
             {
-                await LogWebhook(db, receivedAt, null, rawBody, signatureHeader,
+                await LogWebhook(db, receivedAt, null, sanitizedBody, signatureHeader,
                     false, false, "InvalidSecret", "WebhookSecret inválido", null, 401);
                 return Results.Unauthorized();
             }
 
-            // CAMADA 2 — HMAC-SHA256
-            var hmacKey = config["AbacatePay:HmacPublicKey"] ?? "";
-            var signatureValid = validator.ValidateHmacSignature(rawBody, signatureHeader, hmacKey);
-            if (!signatureValid)
-                logger.LogWarning("HMAC inválido — ignorado temporariamente para diagnóstico. Signature: {Sig}", signatureHeader);
-
-            // CAMADA 3 — Parse payload
+            // CAMADA 2 — Parse payload
             WebhookPayload? payload;
             try
             {
@@ -61,7 +62,7 @@ public static class WebhookEndpoints
             }
             catch
             {
-                await LogWebhook(db, receivedAt, null, rawBody, signatureHeader,
+                await LogWebhook(db, receivedAt, null, sanitizedBody, signatureHeader,
                     true, true, "ParseError", "JSON inválido", null, 200);
                 return Results.Ok();
             }
@@ -73,7 +74,7 @@ public static class WebhookEndpoints
 
             if (string.IsNullOrWhiteSpace(eventType) || string.IsNullOrWhiteSpace(billingId))
             {
-                await LogWebhook(db, receivedAt, eventType, rawBody, signatureHeader,
+                await LogWebhook(db, receivedAt, eventType, sanitizedBody, signatureHeader,
                     true, true, "InvalidPayload", "event ou billing id ausente", billingId, 200);
                 return Results.Ok();
             }
@@ -82,7 +83,7 @@ public static class WebhookEndpoints
             if (payload!.DevMode != expectedDevMode)
             {
                 logger.LogWarning("Webhook DevMode mismatch: received {Received}, expected {Expected}", payload.DevMode, expectedDevMode);
-                await LogWebhook(db, receivedAt, eventType, rawBody, signatureHeader,
+                await LogWebhook(db, receivedAt, eventType, sanitizedBody, signatureHeader,
                     true, true, "DevModeMismatch", $"DevMode mismatch: recebido {payload.DevMode}", billingId, 200);
                 return Results.Ok();
             }
@@ -106,7 +107,7 @@ public static class WebhookEndpoints
 
             if (!knownEvents.Contains(eventType))
             {
-                await LogWebhook(db, receivedAt, eventType, rawBody, signatureHeader,
+                await LogWebhook(db, receivedAt, eventType, sanitizedBody, signatureHeader,
                     true, true, "UnknownEvent", $"Evento desconhecido: {eventType}", billingId, 200);
                 return Results.Ok();
             }
@@ -137,13 +138,13 @@ public static class WebhookEndpoints
                         break;
                 }
 
-                await LogWebhook(db, receivedAt, eventType, rawBody, signatureHeader,
+                await LogWebhook(db, receivedAt, eventType, sanitizedBody, signatureHeader,
                     true, true, "Processed", null, billingId, 200);
             }
             catch (Exception ex)
             {
                 logger.LogError(ex, "Erro ao processar webhook {EventType} para billing {BillingId}", eventType, billingId);
-                await LogWebhook(db, receivedAt, eventType, rawBody, signatureHeader,
+                await LogWebhook(db, receivedAt, eventType, sanitizedBody, signatureHeader,
                     true, true, "ProcessingError", ex.Message, billingId, 200);
             }
 
@@ -374,6 +375,13 @@ public static class WebhookEndpoints
         IDbConnection db, EmailService email, ILogger logger,
         string billingId, int status, string reason, string eventType, DateTime receivedAt)
     {
+        // Idempotency — prevent duplicate emails on webhook replay
+        var existingStatus = await db.QueryFirstOrDefaultAsync<int?>(
+            """SELECT "Status" FROM payment_transactions WHERE "AbacateBillingId" = @BillingId LIMIT 1""",
+            new { BillingId = billingId });
+
+        if (existingStatus == status) return;
+
         await UpdateTransactionStatus(db, billingId, status, reason, eventType, receivedAt);
 
         // Look up customer info to send notification email
@@ -471,4 +479,23 @@ public static class WebhookEndpoints
         bool DevMode,
         DateTime CreatedAt,
         DateTime? UsedAt);
+
+    private static string SanitizeWebhookPayload(string rawBody)
+    {
+        try
+        {
+            var node = System.Text.Json.Nodes.JsonNode.Parse(rawBody);
+            if (node is System.Text.Json.Nodes.JsonObject root &&
+                root["data"] is System.Text.Json.Nodes.JsonObject data)
+            {
+                data.Remove("customer");
+                data.Remove("payerInformation");
+            }
+            return node?.ToJsonString() ?? rawBody;
+        }
+        catch
+        {
+            return rawBody;
+        }
+    }
 }

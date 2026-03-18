@@ -115,11 +115,18 @@ public static class OrderEndpoints
                     if (file.Length > MaxFileSizeBytes)
                         return Results.BadRequest(new { error = "Arquivo excede o limite de 10 MB." });
 
-                    // Validate actual file bytes — content-type is client-controlled and trivially spoofed
-                    if (!await HasValidMagicBytesAsync(file))
+                    // Read bytes once — validate magic bytes and use same data for storage
+                    byte[] fileBytes;
+                    using (var readStream = file.OpenReadStream())
+                    {
+                        fileBytes = new byte[file.Length];
+                        await readStream.ReadExactlyAsync(fileBytes);
+                    }
+
+                    if (!HasValidMagicBytes(fileBytes, file.ContentType))
                         return Results.BadRequest(new { error = "Conteúdo do arquivo não corresponde ao tipo declarado." });
 
-                    refs.Add(new FileReference(file.OpenReadStream(), file.ContentType, file.FileName));
+                    refs.Add(new FileReference(new MemoryStream(fileBytes), file.ContentType, file.FileName));
                     j++;
                 }
 
@@ -182,22 +189,19 @@ public static class OrderEndpoints
     }
 
     // Verify the actual file bytes match the declared MIME type — prevents content-type spoofing
-    private static async Task<bool> HasValidMagicBytesAsync(IFormFile file)
+    private static bool HasValidMagicBytes(byte[] buffer, string contentType)
     {
-        var buffer = new byte[12];
-        using var stream = file.OpenReadStream();
-        var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
-        if (bytesRead < 4) return false;
+        if (buffer.Length < 4) return false;
 
-        return file.ContentType switch
+        return contentType switch
         {
             "image/jpeg" =>
                 buffer[0] == 0xFF && buffer[1] == 0xD8 && buffer[2] == 0xFF,
             "image/png" =>
                 buffer[0] == 0x89 && buffer[1] == 0x50 && buffer[2] == 0x4E && buffer[3] == 0x47,
             "image/webp" =>
-                buffer[0] == 0x52 && buffer[1] == 0x49 && buffer[2] == 0x46 && buffer[3] == 0x46
-                && bytesRead >= 12
+                buffer.Length >= 12
+                && buffer[0] == 0x52 && buffer[1] == 0x49 && buffer[2] == 0x46 && buffer[3] == 0x46
                 && buffer[8] == 0x57 && buffer[9] == 0x45 && buffer[10] == 0x42 && buffer[11] == 0x50,
             "image/gif" =>
                 buffer[0] == 0x47 && buffer[1] == 0x49 && buffer[2] == 0x46 && buffer[3] == 0x38,

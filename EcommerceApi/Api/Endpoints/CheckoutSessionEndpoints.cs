@@ -11,11 +11,15 @@ public static class CheckoutSessionEndpoints
             Guid sessionId,
             IDbConnection db) =>
         {
-            var row = await db.QueryFirstOrDefaultAsync<(Guid Id, DateTime? UsedAt)>(
+            // Single atomic query eliminates TOCTOU race condition:
+            // UsedAt and OrderId are read together — if UsedAt is committed, so is the order
+            var row = await db.QueryFirstOrDefaultAsync<(Guid Id, DateTime? UsedAt, Guid? OrderId)>(
                 """
-                SELECT "Id", "UsedAt"
-                FROM checkout_sessions
-                WHERE "Id" = @Id
+                SELECT cs."Id", cs."UsedAt", o."Id" AS "OrderId"
+                FROM checkout_sessions cs
+                LEFT JOIN payment_transactions pt ON pt."AbacateBillingId" = cs."AbacateBillingId"
+                LEFT JOIN orders o ON o."Id" = pt."OrderId"
+                WHERE cs."Id" = @Id
                 LIMIT 1
                 """,
                 new { Id = sessionId });
@@ -26,18 +30,7 @@ public static class CheckoutSessionEndpoints
             if (!row.UsedAt.HasValue)
                 return Results.Ok(new { status = "pending", orderId = (Guid?)null });
 
-            var orderId = await db.QueryFirstOrDefaultAsync<Guid?>(
-                """
-                SELECT o."Id"
-                FROM orders o
-                INNER JOIN payment_transactions pt ON pt."OrderId" = o."Id"
-                INNER JOIN checkout_sessions cs ON cs."AbacateBillingId" = pt."AbacateBillingId"
-                WHERE cs."Id" = @SessionId
-                LIMIT 1
-                """,
-                new { SessionId = sessionId });
-
-            return Results.Ok(new { status = "paid", orderId });
+            return Results.Ok(new { status = "paid", orderId = row.OrderId });
         })
         .RequireRateLimiting("paymentStatus");
 

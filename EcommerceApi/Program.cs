@@ -22,6 +22,8 @@ builder.Host.UseSerilog((ctx, cfg) =>
 
 // Fail fast if payment secrets are not configured
 var devMode = bool.Parse(builder.Configuration["AbacatePay:DevMode"] ?? "false");
+if (devMode && builder.Environment.IsProduction())
+    throw new InvalidOperationException("DevMode não pode estar habilitado em ambiente de Production.");
 var apiToken = devMode
     ? builder.Configuration["AbacatePay:TestApiToken"]
     : builder.Configuration["AbacatePay:ApiToken"];
@@ -40,6 +42,11 @@ if (string.IsNullOrWhiteSpace(webhookSecret))
 
 // Normalise so the rest of the app always reads the same keys regardless of mode
 builder.Configuration["AbacatePay:WebhookSecret"] = webhookSecret;
+
+
+var allowedOrigins = builder.Configuration.GetSection("AllowedOrigins").Get<string[]>() ?? [];
+if (!devMode && allowedOrigins.Length == 0)
+    throw new InvalidOperationException("AllowedOrigins deve ser configurado em produção. Use fly secrets set.");
 
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
     ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection is not configured.");
@@ -70,7 +77,7 @@ builder.WebHost.ConfigureKestrel(options =>
     options.Limits.MaxRequestBodySize = 50 * 1024 * 1024; // 50 MB
 });
 
-builder.Services.AddTransient<IDbConnection>(_ => new NpgsqlConnection(connectionString));
+builder.Services.AddScoped<IDbConnection>(_ => new NpgsqlConnection(connectionString));
 builder.Services.AddScoped<ProductRepository>();
 builder.Services.AddScoped<StorageService>();
 builder.Services.AddScoped<CreateOrderHandler>();
@@ -95,6 +102,11 @@ builder.Services.AddHttpClient("Resend", client =>
     client.DefaultRequestHeaders.Add("Authorization", $"Bearer {resendToken}");
     client.DefaultRequestHeaders.Add("Accept", "application/json");
     client.Timeout = TimeSpan.FromSeconds(15);
+});
+
+builder.Services.AddHttpClient("R2", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(30);
 });
 
 builder.Services.AddRateLimiter(opt =>

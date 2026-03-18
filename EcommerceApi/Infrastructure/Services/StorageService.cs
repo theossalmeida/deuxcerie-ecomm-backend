@@ -5,6 +5,7 @@ namespace EcommerceApi.Infrastructure.Services;
 
 public class StorageService : IStorageService
 {
+    private readonly IHttpClientFactory _httpClientFactory;
     private readonly string _accessKeyId;
     private readonly string _secretAccessKey;
     private readonly string _bucketName;
@@ -12,10 +13,10 @@ public class StorageService : IStorageService
     private readonly string _publicBaseUrl;
     private const string Region = "auto";
     private const string Service = "s3";
-    private static readonly HttpClient _httpClient = new();
 
-    public StorageService(IConfiguration configuration)
+    public StorageService(IHttpClientFactory httpClientFactory, IConfiguration configuration)
     {
+        _httpClientFactory = httpClientFactory;
         _accessKeyId = configuration["R2:AccessKeyId"]
             ?? throw new InvalidOperationException("R2:AccessKeyId is not configured.");
         _secretAccessKey = configuration["R2:SecretAccessKey"]
@@ -64,6 +65,8 @@ public class StorageService : IStorageService
         var signature = HmacHex(DeriveSigningKey(dateStamp), stringToSign);
         var authorization = $"AWS4-HMAC-SHA256 Credential={_accessKeyId}/{credentialScope}, SignedHeaders={signedHeaders}, Signature={signature}";
 
+        var client = _httpClientFactory.CreateClient("R2");
+
         using var request = new HttpRequestMessage(HttpMethod.Put, $"{_endpoint}/{_bucketName}/{objectKey}");
         request.Headers.TryAddWithoutValidation("Authorization", authorization);
         request.Headers.TryAddWithoutValidation("x-amz-content-sha256", payloadHash);
@@ -71,7 +74,7 @@ public class StorageService : IStorageService
         request.Content = new ByteArrayContent(bytes);
         request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
 
-        var response = await _httpClient.SendAsync(request);
+        var response = await client.SendAsync(request);
         if (!response.IsSuccessStatusCode)
         {
             var error = await response.Content.ReadAsStringAsync();

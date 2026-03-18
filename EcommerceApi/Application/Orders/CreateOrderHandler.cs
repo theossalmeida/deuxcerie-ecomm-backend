@@ -52,18 +52,17 @@ public class CreateOrderHandler(
             var product = await productRepo.GetByIdAsync(item.ProductId);
 
             if (product is null || !product.ProductStatus)
-                throw new InvalidOperationException($"Produto {item.ProductId} não encontrado ou inativo.");
+                throw new InvalidOperationException("Um ou mais produtos não estão disponíveis. Atualize seu carrinho.");
 
             var expectedPrice = command.PaymentMethod == "CARD"
                 ? (int)Math.Round(product.Price * 1.05)
                 : product.Price;
 
             if (item.PaidPrice < expectedPrice)
-                throw new InvalidOperationException(
-                    $"O preço do produto {item.ProductId} mudou. Por favor, atualize seu carrinho.");
+                throw new InvalidOperationException("O preço de um produto foi atualizado. Por favor, atualize seu carrinho.");
 
             if (product.Price == 0)
-                throw new InvalidOperationException($"Preço inválido para o produto {item.ProductId}.");
+                throw new InvalidOperationException("Um ou mais produtos possui preço inválido.");
 
             baseCents += (long)item.Quantity * product.Price;
 
@@ -181,12 +180,13 @@ public class CreateOrderHandler(
             SELECT "Id", "CheckoutUrl"
             FROM checkout_sessions
             WHERE "ClientMobile" = @Mobile
+              AND "Email"        = @Email
               AND "AmountCents"  = @Amount
               AND "UsedAt"       IS NULL
               AND "CreatedAt"    > @Threshold
             LIMIT 1
             """,
-            new { Mobile = command.ClientMobile, Amount = cardAmountCents, Threshold = DateTime.UtcNow.AddMinutes(-5) });
+            new { Mobile = command.ClientMobile, Email = command.Email, Amount = cardAmountCents, Threshold = DateTime.UtcNow.AddMinutes(-5) });
 
         if (recent.Id != default)
         {
@@ -258,8 +258,11 @@ public class CreateOrderHandler(
             throw new ArgumentException("taxId (CPF) é obrigatório.");
         if (cmd.DeliveryDate == default)
             throw new ArgumentException("deliveryDate inválido.");
-        var minDeliveryDate = DateTime.UtcNow.Date.AddDays(2);
-        if (cmd.DeliveryDate.Date < minDeliveryDate)
+        var brazilTz = TimeZoneInfo.FindSystemTimeZoneById("America/Sao_Paulo");
+        var brazilNow = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, brazilTz);
+        var minDeliveryDate = DateOnly.FromDateTime(brazilNow).AddDays(2);
+        var submittedDate = DateOnly.FromDateTime(cmd.DeliveryDate);
+        if (submittedDate < minDeliveryDate)
             throw new ArgumentException($"Data de entrega mínima é {minDeliveryDate:dd/MM/yyyy}.");
         if (cmd.Items.Count == 0)
             throw new ArgumentException("O pedido deve ter pelo menos 1 item.");
