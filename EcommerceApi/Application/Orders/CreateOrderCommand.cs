@@ -12,7 +12,10 @@ public record OrderItemCommand(
 public record CreateOrderCommand(
     string ClientName,
     string ClientMobile,
+    string Email,
+    string TaxId,
     DateTime DeliveryDate,
     IReadOnlyList<OrderItemCommand> Items);
 
-public record CreateOrderResult(Guid OrderId, Guid ClientId, long TotalPaid);
+// sessionId = checkout_sessions.Id — the actual orderId is assigned after payment confirmation
+public record CreateOrderResult(Guid SessionId, string CheckoutUrl);
