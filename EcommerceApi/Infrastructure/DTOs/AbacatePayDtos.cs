@@ -9,21 +9,24 @@ public record CreateAbacateCustomerRequest(
     string TaxId
 );
 
-public record AbacateBillingProductRequest(
+public record CreateAbacateProductRequest(
     string ExternalId,
     string Name,
+    int Price,
+    string Currency,
     string? Description,
-    int Quantity,
-    int Price
+    string? ImageUrl
 );
 
-public record CreateAbacateBillingRequest(
-    string Frequency,
+public record AbacateCheckoutItem(string Id, int Quantity);
+
+public record CreateAbacateCheckoutRequest(
+    AbacateCheckoutItem[] Items,
     string[] Methods,
-    AbacateBillingProductRequest[] Products,
-    string ReturnUrl,
-    string CompletionUrl,
-    string CustomerId
+    string? CustomerId,
+    string? ReturnUrl,
+    string? CompletionUrl,
+    string? ExternalId
 );
 
 // ---------- Responses ----------
@@ -45,18 +48,27 @@ public record AbacateCustomerResponse(
     string? Error
 );
 
-public record AbacateBillingProductResponse(string Id, string ExternalId, int Quantity);
+public record AbacateProductData(
+    string Id,
+    string ExternalId,
+    string Name,
+    int Price,
+    string Status,
+    bool DevMode
+);
 
-public record AbacateBillingData(
+public record AbacateProductResponse(AbacateProductData? Data, string? Error);
+
+public record AbacateCheckoutData(
     string Id,
     string Url,
     long Amount,
+    long? PaidAmount,
     string Status,
-    bool DevMode,
-    AbacateBillingProductResponse[]? Products
+    bool DevMode
 );
 
-public record AbacateBillingResponse(AbacateBillingData? Data, string? Error);
+public record AbacateCheckoutResponse(AbacateCheckoutData? Data, string? Error);
 
 // ---------- Webhook Payload ----------
 // Payload real (checkout.completed):

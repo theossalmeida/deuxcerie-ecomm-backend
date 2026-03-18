@@ -194,13 +194,11 @@ public static class WebhookEndpoints
         }
 
         // CAMADA 5 — Amount validation
-        // Support both payload shapes: data.checkout.paidAmount (checkout.completed)
-        // and data.billing.paidAmount (billing.paid / pix.paid)
-        var rawPaidAmount = payload.Data?.Checkout?.PaidAmount ?? payload.Data?.Billing?.PaidAmount;
-        // In devMode, simulated payments send paidAmount=0; fall back to payment.amount.
-        var paidAmount = (payload.DevMode && (rawPaidAmount is null || rawPaidAmount == 0))
-            ? payload.Data?.Payment?.Amount
-            : rawPaidAmount;
+        // Prefer data.payment.amount (present in all event types).
+        // Fall back to checkout.paidAmount / billing.paidAmount for older payload shapes.
+        var paidAmount = payload.Data?.Payment?.Amount
+            ?? payload.Data?.Checkout?.PaidAmount
+            ?? payload.Data?.Billing?.PaidAmount;
 
         if (paidAmount is null)
         {
@@ -341,8 +339,8 @@ public static class WebhookEndpoints
                     PaymentMethod = paymentMethod,
                     Status = 2, // Paid
                     AmountCents = session.AmountCents,
-                    PaidAmountCents = checkout?.PaidAmount ?? billingData?.PaidAmount,
-                    PlatformFeeCents = checkout?.PlatformFee ?? billingData?.PlatformFee,
+                    PaidAmountCents = payload.Data?.Payment?.Amount ?? checkout?.PaidAmount ?? billingData?.PaidAmount,
+                    PlatformFeeCents = payload.Data?.Payment?.Fee != 0 ? payload.Data?.Payment?.Fee : checkout?.PlatformFee ?? billingData?.PlatformFee,
                     CheckoutUrl = session.CheckoutUrl,
                     ReceiptUrl = checkout?.ReceiptUrl ?? billingData?.ReceiptUrl,
                     // PIX: payer name from payerInformation.PIX.name, tax id from customer (masked)

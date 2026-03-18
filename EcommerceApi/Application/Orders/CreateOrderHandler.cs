@@ -1,5 +1,6 @@
 using Dapper;
 using EcommerceApi.Infrastructure.DTOs;
+using EcommerceApi.Infrastructure.Repositories;
 using EcommerceApi.Infrastructure.Services;
 using System.Data;
 using System.Text.Json;
@@ -12,6 +13,7 @@ public class CreateOrderHandler(
     IDbConnection db,
     StorageService storage,
     AbacatePayService abacatePay,
+    ProductRepository productRepo,
     IConfiguration config,
     ILogger<CreateOrderHandler> logger)
 {
@@ -42,14 +44,13 @@ public class CreateOrderHandler(
         // 2. Validate products and calculate totals (critical security check — before charging)
         long amountCents = 0;
         var itemSnapshots = new List<CheckoutItemSnapshot>();
+        var checkoutItems = new List<AbacateCheckoutItem>();
 
         foreach (var item in command.Items)
         {
-            var product = await db.QueryFirstOrDefaultAsync<(Guid Id, int Price, string Name)>(
-                """SELECT "Id", "Price", "Name" FROM products WHERE "Id" = @Id AND "ProductStatus" = true""",
-                new { Id = item.ProductId });
+            var product = await productRepo.GetByIdAsync(item.ProductId);
 
-            if (product == default)
+            if (product is null || !product.ProductStatus)
                 throw new InvalidOperationException($"Produto {item.ProductId} não encontrado ou inativo.");
 
             if (item.PaidPrice < product.Price)
@@ -59,12 +60,28 @@ public class CreateOrderHandler(
             if (product.Price == 0)
                 throw new InvalidOperationException($"Preço inválido para o produto {item.ProductId}.");
 
-            // Use BasePrice for AbacatePay — keeps the product price stable across billings.
-            // PaidPrice is validated above (must be >= BasePrice) but the charge is always BasePrice.
+            // Ensure product exists in AbacatePay (lazy sync on first use)
+            var abacateProductId = product.AbacateStoreProductId;
+            if (abacateProductId is null)
+            {
+                var productResponse = await abacatePay.CreateProductAsync(
+                    product.Id, product.Name, product.Price, product.Description);
+
+                if (productResponse?.Data is null)
+                {
+                    logger.LogError("Falha ao criar produto {ProductId} no AbacatePay", product.Id);
+                    throw new PaymentGatewayException("Falha ao processar pagamento. Tente novamente.");
+                }
+
+                abacateProductId = productResponse.Data.Id;
+                await productRepo.UpdateAbacateProductIdAsync(product.Id, abacateProductId);
+            }
+
             amountCents += (long)item.Quantity * product.Price;
             itemSnapshots.Add(new CheckoutItemSnapshot(
                 item.ProductId, product.Name, item.Quantity,
                 product.Price, product.Price, item.Observation));
+            checkoutItems.Add(new AbacateCheckoutItem(abacateProductId, item.Quantity));
         }
 
         // 3. Dedup — if this exact cart was submitted in the last 5 minutes, return the existing session.
@@ -99,31 +116,25 @@ public class CreateOrderHandler(
 
         var abacateCustomerId = customerResponse.Data.Id;
 
-        // 5. Create billing in AbacatePay
-        var billingRequest = new CreateAbacateBillingRequest(
-            Frequency: "ONE_TIME",
+        // 5. Create checkout in AbacatePay
+        var checkoutRequest = new CreateAbacateCheckoutRequest(
+            Items: checkoutItems.ToArray(),
             Methods: ["PIX", "CARD"],
-            Products: itemSnapshots.Select((s, i) => new AbacateBillingProductRequest(
-                ExternalId: $"{s.ProductId}_{sessionId}",
-                Name: s.Name,
-                Description: "",
-                Quantity: s.Quantity,
-                Price: s.BasePrice
-            )).ToArray(),
+            CustomerId: abacateCustomerId,
             ReturnUrl: $"{config["AbacatePay:ReturnUrl"]}?session={sessionId}",
             CompletionUrl: config["AbacatePay:CompletionUrl"]!,
-            CustomerId: abacateCustomerId
+            ExternalId: sessionId.ToString()
         );
 
-        var billingResponse = await abacatePay.CreateBillingAsync(billingRequest);
+        var checkoutResponse = await abacatePay.CreateCheckoutAsync(checkoutRequest);
 
-        if (billingResponse?.Data is null)
+        if (checkoutResponse?.Data is null)
         {
-            logger.LogError("Falha ao criar billing AbacatePay");
+            logger.LogError("Falha ao criar checkout AbacatePay");
             throw new PaymentGatewayException("Falha ao processar pagamento. Tente novamente.");
         }
 
-        var billingData = billingResponse.Data;
+        var billingData = checkoutResponse.Data;
 
         // 6. Persist checkout session — the order will be created only after webhook confirmation
         var devMode = bool.Parse(config["AbacatePay:DevMode"] ?? "false");

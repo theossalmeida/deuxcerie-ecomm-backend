@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(find /c/Projetos/Deuxcerie/deuxcerie-backend -not -path */bin/* -not -path */obj/* -not -path */.vs/* -not -path */.git/* -type f)",
-      "Bash(xargs grep:*)"
+      "Bash(xargs grep:*)",
+      "WebFetch(domain:docs.abacatepay.com)",
+      "Bash(dotnet build:*)"
     ]
   }
 }
