@@ -5,7 +5,9 @@
       "Bash(xargs grep:*)",
       "WebFetch(domain:docs.abacatepay.com)",
       "Bash(dotnet build:*)",
-      "Read(//c/Users/theoa/.claude/projects/C--Projetos-Deuxcerie-deuxcerie-backend/**)"
+      "Read(//c/Users/theoa/.claude/projects/C--Projetos-Deuxcerie-deuxcerie-backend/**)",
+      "Bash(find /c/Projetos/Deuxcerie -type f -name *.sql)",
+      "Bash(git log:*)"
     ]
   }
 }

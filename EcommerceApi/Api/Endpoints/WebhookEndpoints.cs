@@ -42,10 +42,12 @@ public static class WebhookEndpoints
 
             var signatureHeader = ctx.Request.Headers["X-Webhook-Signature"].ToString();
 
-            // CAMADA 1 — webhookSecret
+            // CAMADA 1 — webhookSecret (aceita secret principal ou secret de refund)
             var receivedSecret = ctx.Request.Query["webhookSecret"].ToString();
-            var expectedSecret = config["AbacatePay:WebhookSecret"] ?? "";
-            var secretValid = validator.ValidateWebhookSecret(receivedSecret, expectedSecret);
+            var mainSecret = config["AbacatePay:WebhookSecret"] ?? "";
+            var refundSecret = config["AbacatePay:RefundWebhookSecret"] ?? "";
+            var secretValid = validator.ValidateWebhookSecret(receivedSecret, mainSecret)
+                || (!string.IsNullOrEmpty(refundSecret) && validator.ValidateWebhookSecret(receivedSecret, refundSecret));
 
             if (!secretValid)
             {
@@ -384,6 +386,11 @@ public static class WebhookEndpoints
 
         await UpdateTransactionStatus(db, billingId, status, reason, eventType, receivedAt);
 
+        // Cancel the order and its items when refunded
+        Guid? orderId = null;
+        if (status == 4)
+            orderId = await CancelOrderAsync(db, billingId, receivedAt);
+
         // Look up customer info to send notification email
         var session = await db.QueryFirstOrDefaultAsync<(string Email, string ClientName)>(
             """
@@ -401,9 +408,30 @@ public static class WebhookEndpoints
         }
 
         if (status == 4)
-            _ = email.SendPaymentRefundedAsync(session.Email, session.ClientName);
+            _ = email.SendOrderCancelledAsync(session.Email, session.ClientName, orderId);
         else if (status == 5)
             _ = email.SendPaymentDisputedAsync(session.Email, session.ClientName);
+    }
+
+    private static async Task<Guid?> CancelOrderAsync(IDbConnection db, string billingId, DateTime now)
+    {
+        var orderId = await db.QueryFirstOrDefaultAsync<Guid?>(
+            """SELECT "OrderId" FROM payment_transactions WHERE "AbacateBillingId" = @BillingId LIMIT 1""",
+            new { BillingId = billingId });
+
+        if (orderId is null)
+            return null;
+
+        // Status 5 = Cancelled
+        await db.ExecuteAsync(
+            """UPDATE orders SET "Status" = 5, "UpdatedAt" = @Now WHERE "Id" = @OrderId""",
+            new { Now = now, OrderId = orderId.Value });
+
+        await db.ExecuteAsync(
+            """UPDATE order_items SET "ItemCanceled" = true, "UpdatedAt" = @Now WHERE "OrderId" = @OrderId""",
+            new { Now = now, OrderId = orderId.Value });
+
+        return orderId;
     }
 
     private static async Task UpdateTransactionStatus(

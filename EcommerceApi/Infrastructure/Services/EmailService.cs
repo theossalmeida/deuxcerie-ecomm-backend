@@ -24,15 +24,22 @@ public class EmailService(
         await SendAsync(toEmail, subject, html);
     }
 
-    public async Task SendPaymentRefundedAsync(string toEmail, string clientName)
+    public async Task SendOrderCancelledAsync(string toEmail, string clientName, Guid? orderId)
     {
-        var subject = "Estorno processado — Deuxcerie";
+        var subject = "Pedido cancelado — Deuxcerie";
+        var orderInfo = orderId.HasValue ? $"<p><strong>Pedido:</strong> #{orderId.Value}</p>" : "";
         var html = $"""
-            <p>Olá, <strong>{clientName}</strong>!</p>
-            <p>O estorno do seu pagamento foi processado com sucesso.</p>
-            <p>O valor será creditado de acordo com a política da sua instituição financeira.</p>
-            <p>Se tiver dúvidas, entre em contato com nosso suporte.</p>
+            <p>Olá, <strong>{clientName}</strong>,</p>
+            <p>Lamentamos informar que o seu pedido foi cancelado.</p>
+            {orderInfo}
+            <p>O reembolso do valor pago já foi solicitado e será creditado automaticamente. O prazo pode variar de acordo com a sua instituição financeira:</p>
+            <ul>
+              <li><strong>PIX:</strong> em até 1 dia útil</li>
+              <li><strong>Cartão de crédito:</strong> em até 2 faturas</li>
+            </ul>
+            <p>Se você não solicitou este cancelamento ou tiver qualquer dúvida, entre em contato com nosso suporte — faremos o possível para ajudar.</p>
             <br/>
+            <p>Pedimos desculpas pelo inconveniente.</p>
             <p>Atenciosamente,<br/>Equipe Deuxcerie</p>
             """;
 
